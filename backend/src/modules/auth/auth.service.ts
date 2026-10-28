@@ -1,0 +1,188 @@
+import argon2 from 'argon2';
+import { eq, or, sql } from 'drizzle-orm';
+import { db } from '../../db/index';
+import { users } from '../../../../database/schema/users';
+import { signAccessToken, verifyAccessToken, issueRefreshToken } from './token.service';
+import { ForbiddenError } from '../../utils/errors';
+
+export type { AccessTokenPayload } from './token.service';
+
+export type AuthResult =
+  | {
+      success: true;
+      accessToken: string;
+      token: string;
+      refreshToken?: string;
+      user: {
+        id: string;
+        full_name: string;
+        phone: string;
+        email: string;
+        role: string;
+        preferred_language: string;
+      };
+    }
+  | {
+      success: false;
+      reason: 'USER_NOT_FOUND';
+    }
+  | {
+      success: false;
+      reason: 'PASSWORD_MISMATCH' | 'ACCOUNT_PENDING' | 'ACCOUNT_REJECTED' | 'ACCOUNT_DISABLED';
+      userId: string;
+    }
+  | {
+      success: false;
+      reason: 'ACCOUNT_DEACTIVATED';
+      userId: string;
+    }
+  | {
+      success: false;
+      reason: 'ACCOUNT_PENDING_APPROVAL';
+      userId: string;
+    };
+
+/**
+ * Hash password using Argon2id.
+ */
+export async function hashPassword(password: string): Promise<string> {
+  return argon2.hash(password, { type: argon2.argon2id });
+}
+
+/**
+ * Verify password against Argon2id hash.
+ */
+export async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  try {
+    return await argon2.verify(hash, password);
+  } catch {
+    return false;
+  }
+}
+
+export async function authenticate(identifier: string, password: string): Promise<AuthResult> {
+  const trimmed = identifier.trim();
+  console.log(`[AUTH] Login attempt for identifier: "${trimmed}"`);
+
+  // Phone variation support: 09XXXXXXXX <-> +2519XXXXXXXX
+  let altPhone: string | null = null;
+  if (trimmed.startsWith('+251') && trimmed.length === 13) {
+    altPhone = '0' + trimmed.slice(4);
+  } else if (trimmed.startsWith('09') && trimmed.length === 10) {
+    altPhone = '+251' + trimmed.slice(1);
+  }
+
+  const conditions = [
+    sql`lower(${users.email}) = ${trimmed.toLowerCase()}`,
+    eq(users.phone, trimmed),
+  ];
+  if (altPhone) {
+    conditions.push(eq(users.phone, altPhone));
+  }
+
+  const [user] = await db
+    .select()
+    .from(users)
+    .where(or(...conditions))
+    .limit(1);
+
+  if (!user) {
+    console.log(`[AUTH] User not found for identifier: "${trimmed}"`);
+    return { success: false, reason: 'USER_NOT_FOUND' };
+  }
+
+  const isValid = await verifyPassword(password, user.passwordHash);
+  if (!isValid) {
+    console.log(`[AUTH] Invalid password for identifier: "${trimmed}"`);
+    return { success: false, reason: 'PASSWORD_MISMATCH', userId: user.id };
+  }
+
+  // Account gates: only approved, active accounts may sign in.
+  if (user.status === 'PENDING' || user.status === 'PENDING_APPROVAL') {
+    return { success: false, reason: 'ACCOUNT_PENDING', userId: user.id };
+  }
+  if (user.status === 'REJECTED') {
+    return { success: false, reason: 'ACCOUNT_REJECTED', userId: user.id };
+  }
+  if (user.active === false) {
+    return { success: false, reason: 'ACCOUNT_DISABLED', userId: user.id };
+  }
+
+  console.log(`[AUTH] Password verified for user: ${user.id} (${user.role})`);
+  const accessToken = signAccessToken({ id: user.id, role: user.role as any });
+  console.log(`[JWT] Access token generated for userId=${user.id}`);
+
+  let refreshToken: string | undefined;
+  try {
+    refreshToken = await issueRefreshToken(user.id);
+  } catch (err) {
+    console.warn('[AUTH] Could not issue refresh token:', err);
+  }
+
+  return {
+    success: true,
+    accessToken,
+    token: accessToken,
+    refreshToken,
+    user: {
+      id: user.id,
+      full_name: user.fullName,
+      phone: user.phone ?? '',
+      email: user.email ?? '',
+      role: user.role,
+      preferred_language: user.preferredLanguage,
+    },
+  };
+}
+
+export async function registerUser(data: {
+  fullName: string;
+  phone: string;
+  email?: string;
+  password: string;
+  role: string;
+  preferredLanguage: string;
+}) {
+  if (data.role === 'ADMIN' || !['FARMER', 'EXTENSION_WORKER', 'EXPERT'].includes(data.role)) {
+    throw new ForbiddenError('ADMIN accounts cannot be self-registered');
+  }
+
+  console.log(`[AUTH] Registering new user: ${data.fullName} (${data.role})`);
+  // Store phones in one canonical form (+2519XXXXXXXX) so 09... and +251... can't coexist.
+  const phone = data.phone.startsWith('09') ? '+251' + data.phone.slice(1) : data.phone;
+  // The users table has no unique index on phone/email, so reject duplicates here.
+  const dupConditions = [eq(users.phone, phone)];
+  if (data.email) dupConditions.push(sql`lower(${users.email}) = ${data.email.toLowerCase()}`);
+  const [existing] = await db.select({ id: users.id }).from(users).where(or(...dupConditions)).limit(1);
+  if (existing) {
+    throw Object.assign(new Error('Account already exists'), { code: '23505' });
+  }
+
+  const isStaff = data.role === 'EXTENSION_WORKER' || data.role === 'EXPERT';
+  const status = isStaff ? 'PENDING' : 'APPROVED';
+  const active = !isStaff;
+
+  const passwordHash = await hashPassword(data.password);
+  const [user] = await db
+    .insert(users)
+    .values({
+      fullName: data.fullName,
+      phone,
+      email: data.email ?? null,
+      passwordHash,
+      role: data.role,
+      preferredLanguage: data.preferredLanguage,
+      status,
+      active,
+    })
+    .returning();
+  console.log(`[DATABASE] User created: id=${user.id}, role=${user.role}, status=${user.status}`);
+  return user;
+}
+
+export async function getUser(id: string) {
+  const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  return user;
+}
+
+export { verifyAccessToken as verifyToken };
